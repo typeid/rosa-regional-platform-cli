@@ -10,6 +10,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/openshift-online/rosa-regional-platform-cli/internal/aws"
 	"github.com/openshift-online/rosa-regional-platform-cli/internal/config"
@@ -85,74 +86,36 @@ Example:
 }
 
 func runList(ctx context.Context, opts *listOptions) error {
-	// Get the platform API URL from config
 	baseURL, err := config.GetPlatformAPIURL()
 	if err != nil {
 		return err
 	}
 
-	// Build the API endpoint URL
 	endpoint := fmt.Sprintf("%s/api/v0/clusters?limit=%d&offset=%d", baseURL, opts.limit, opts.offset)
 	if opts.status != "" {
 		endpoint = fmt.Sprintf("%s&status=%s", endpoint, opts.status)
 	}
 
-	// Load AWS config for SigV4 signing
 	cfg, err := aws.NewConfig(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	// Create HTTP request
-	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Sign the request with AWS SigV4
-	signer := v4.NewSigner()
 	creds, err := cfg.Credentials.Retrieve(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to retrieve AWS credentials: %w", err)
 	}
 
-	// Determine the region from AWS config
 	region := cfg.Region
 	if region == "" {
-		region = "us-east-1" // Default region
+		region = "us-east-1"
 	}
 
-	// SHA256 hash of empty body for GET requests
-	emptyBodyHash := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-
-	err = signer.SignHTTP(ctx, creds, req, emptyBodyHash, "execute-api", region, time.Now())
+	body, err := signedGet(ctx, endpoint, creds, region)
 	if err != nil {
-		return fmt.Errorf("failed to sign request: %w", err)
+		return err
 	}
 
-	// Execute the request
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to execute request: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	// Read the response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read response: %w", err)
-	}
-
-	// Check for error responses
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	// If JSON output requested, print raw response
 	if opts.output == "json" {
 		var result map[string]interface{}
 		if err := json.Unmarshal(body, &result); err != nil {
@@ -164,34 +127,40 @@ func runList(ctx context.Context, opts *listOptions) error {
 		return nil
 	}
 
-	// Parse the JSON response for table display
 	var result listResponse
 	if err := json.Unmarshal(body, &result); err != nil {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	// Display as table
-	return displayTable(result.Items)
+	apiURLs := make([]string, len(result.Items))
+	for i, cluster := range result.Items {
+		apiURLs[i] = fetchAPIURL(ctx, baseURL, cluster.ID, creds, region)
+	}
+
+	return displayTable(result.Items, apiURLs)
 }
 
-func displayTable(clusters []clusterItem) error {
+func displayTable(clusters []clusterItem, apiURLs []string) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 
-	// Print header
-	if _, err := fmt.Fprintln(w, "ID\tNAME\tVERSION\tAVAILABLE\tREADY\tMESSAGE"); err != nil {
+	if _, err := fmt.Fprintln(w, "ID\tNAME\tAPI URL\tVERSION\tAVAILABLE\tREADY\tMESSAGE"); err != nil {
 		return err
 	}
 
-	// Print each cluster
-	for _, cluster := range clusters {
-		// Extract status and message from conditions
+	for i, cluster := range clusters {
 		available := getConditionStatus(cluster.Status.Conditions, "Available")
 		ready := getConditionStatus(cluster.Status.Conditions, "Ready")
 		message := getConditionMessage(cluster.Status.Conditions, "Ready")
 
-		if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+		apiURL := "-"
+		if i < len(apiURLs) && apiURLs[i] != "" {
+			apiURL = apiURLs[i]
+		}
+
+		if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			cluster.ID,
 			cluster.Name,
+			apiURL,
 			cluster.Spec.Version,
 			available,
 			ready,
@@ -214,22 +183,75 @@ func getConditionStatus(conditions []condition, condType string) string {
 }
 
 func getConditionMessage(conditions []condition, condType string) string {
-	// First try the specified condition type
 	for _, cond := range conditions {
 		if cond.Type == condType && cond.Message != "" {
 			return cond.Message
 		}
 	}
-	// Fall back to Adapter1Successful which typically has the main status message
 	for _, cond := range conditions {
 		if cond.Type == "Adapter1Successful" && cond.Message != "" {
 			return cond.Message
 		}
 	}
-	// Finally return any condition with a message
 	for _, cond := range conditions {
 		if cond.Message != "" {
 			return cond.Message
+		}
+	}
+	return ""
+}
+
+func signedGet(ctx context.Context, url string, creds awssdk.Credentials, region string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	const emptyBodyHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	signer := v4.NewSigner()
+	if err := signer.SignHTTP(ctx, creds, req, emptyBodyHash, "execute-api", region, time.Now()); err != nil {
+		return nil, fmt.Errorf("failed to sign request: %w", err)
+	}
+
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	return body, nil
+}
+
+func fetchAPIURL(ctx context.Context, baseURL, clusterID string, creds awssdk.Credentials, region string) string {
+	endpoint := fmt.Sprintf("%s/api/v0/clusters/%s/statuses", baseURL, clusterID)
+	body, err := signedGet(ctx, endpoint, creds, region)
+	if err != nil {
+		return ""
+	}
+
+	var envelope struct {
+		ControllerStatuses []struct {
+			Data map[string]interface{} `json:"data"`
+		} `json:"controller_statuses"`
+	}
+	if json.Unmarshal(body, &envelope) != nil {
+		return ""
+	}
+
+	for _, cs := range envelope.ControllerStatuses {
+		if hc, ok := cs.Data["hostedCluster"].(map[string]interface{}); ok {
+			if ep, ok := hc["apiEndpoint"].(string); ok && ep != "" {
+				return ep
+			}
 		}
 	}
 	return ""
